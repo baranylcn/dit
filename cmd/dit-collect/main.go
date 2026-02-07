@@ -517,7 +517,7 @@ func genSeedCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 
 			enc := json.NewEncoder(f)
 			count := 0
@@ -591,7 +591,7 @@ func loadSeeds(path string) ([]seedEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var seeds []seedEntry
 	scanner := bufio.NewScanner(f)
@@ -616,7 +616,7 @@ func loadLines(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var lines []string
 	scanner := bufio.NewScanner(f)
@@ -666,7 +666,7 @@ func fetchHTML(client *http.Client, rawURL, userAgent string) (string, int, erro
 	if err != nil {
 		return "", 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body := make([]byte, 0, 1024*1024)
 	buf := make([]byte, 32*1024)
@@ -753,7 +753,7 @@ func manglePath(rawURL string) string {
 	segment := path[lastSlash+1:]
 	if segment == "" {
 		segment = "page"
-		path = path + segment
+		path += segment
 		lastSlash = strings.LastIndex(path, "/")
 		segment = path[lastSlash+1:]
 	}
