@@ -15,11 +15,13 @@ go test ./...
 
 dit is a Go port of [Formasaurus](https://github.com/scrapinghub/Formasaurus) with zero external ML dependencies.
 
-**Two-stage ML pipeline:**
+**Three-stage ML pipeline:**
 
 1. **Form type detection** -- Logistic regression (L-BFGS optimizer, L2 regularization) trained on features extracted from HTML forms: element counts, submit button text, input names, CSS classes, form action URL, label text, and link text.
 
 2. **Field type detection** -- Linear-chain CRF (Conditional Random Field) with OWL-QN trainer (L1 support). Features include field tag/type/name/value/placeholder, CSS class/ID, label text, text before/after the field, and the form type predicted by stage 1.
+
+3. **Page type detection** -- Logistic regression trained on page-level features: title, headings, meta description, CSS classes, nav text, URL patterns, page structure indicators, and form classification results from stage 1.
 
 Accuracy is estimated via grouped k-fold cross-validation (grouped by domain using public suffix list).
 
@@ -28,22 +30,26 @@ Accuracy is estimated via grouped k-fold cross-validation (grouped by domain usi
 ```
 dit.go, train.go         Public SDK (dit.New, dit.Load, dit.Train, dit.Evaluate)
 cmd/dit/                  CLI tool
-classifier/               Form type (LogReg) + field type (CRF) classifiers
-  formtype.go             LogReg training and inference
+cmd/dit-collect/          Data collection tool for page annotations
+classifier/               Form type (LogReg) + field type (CRF) + page type (LogReg) classifiers
+  formtype.go             Form LogReg training and inference
   fieldtype.go            CRF wrapper for field classification
-  formtype_features.go    9 feature pipelines (FormElements, SubmitText, etc.)
+  pagetype.go             Page LogReg training and inference
+  formtype_features.go    9 form feature pipelines (FormElements, SubmitText, etc.)
   fieldtype_features.go   Per-field CRF features (ElemFeatures, GetFormFeatures)
+  pagetype_features.go    9 page feature pipelines (PageStructure, PageTitle, etc.)
   model.go                Serialization (SaveModel, LoadClassifier)
 crf/                      Standalone linear-chain CRF implementation
   trainer.go              OWL-QN optimizer (L1 regularization)
   forward_backward.go     Forward-backward algorithm
   viterbi.go              Viterbi decoding
   feature.go              Feature-to-attribute conversion
-internal/htmlutil/        goquery-based HTML parsing, form/field extraction, text-around-elements
+internal/htmlutil/        goquery-based HTML parsing, form/field/page extraction
 internal/storage/         Annotation data loading (config.json, index.json, HTML files)
 internal/textutil/        Tokenize, Ngrams, Normalize, NumberPattern
 internal/vectorizer/      SparseVector, CountVectorizer, TfidfVectorizer, DictVectorizer
-data/                     Annotated HTML forms + config
+data/forms/               Annotated HTML forms + config
+data/pages/               Annotated HTML pages + config
 ```
 
 ### Key Design Decisions
@@ -64,9 +70,13 @@ Full documentation is available at [pkg.go.dev/github.com/happyhackingspace/dit]
 func New() (*Classifier, error)                              // auto-finds model.json
 func Load(path string) (*Classifier, error)                  // from specific path
 
-// Classify
+// Classify forms
 func (c *Classifier) ExtractForms(html string) ([]FormResult, error)
 func (c *Classifier) ExtractFormsProba(html string, threshold float64) ([]FormResultProba, error)
+
+// Classify page type
+func (c *Classifier) ExtractPageType(html string) (*PageResult, error)
+func (c *Classifier) ExtractPageTypeProba(html string, threshold float64) (*PageResultProba, error)
 
 // Train
 func Train(dataDir string, config *TrainConfig) (*Classifier, error)
@@ -92,27 +102,40 @@ func Evaluate(dataDir string, config *EvalConfig) (*EvalResult, error)
 
 ## Data Contributions
 
-The training data lives in `data/` and consists of annotated HTML forms from real websites.
+The training data lives in `data/` and consists of annotated HTML forms and pages from real websites.
 
-### Adding New Annotations
+### Adding Form Annotations
 
-1. Add the HTML file to `data/html/`.
-2. Update `data/index.json` with the URL, form types, and field annotations.
-3. Follow the type codes defined in `data/config.json`.
-4. Re-train and verify accuracy doesn't regress:
-   ```bash
-   go run ./cmd/dit train model.json --data-folder data
-   go run ./cmd/dit evaluate --data-folder data
-   ```
+1. Add the HTML file to `data/forms/html/`.
+2. Update `data/forms/index.json` with the URL, form types, and field annotations.
+3. Follow the type codes defined in `data/forms/config.json`.
 
-### Annotation Format
+### Adding Page Annotations
 
-Each entry in `index.json` maps an HTML file path to:
+1. Add the HTML file to `data/pages/html/`.
+2. Update `data/pages/index.json` with the URL and page type.
+3. Follow the type codes defined in `data/pages/config.json`.
+
+### Verifying Changes
+
+Re-train and verify accuracy doesn't regress:
+```bash
+go run ./cmd/dit train model.json --data-folder data
+go run ./cmd/dit evaluate --data-folder data
+```
+
+### Annotation Formats
+
+**Form annotations** (`data/forms/index.json`): each entry maps an HTML file path to:
 - `url` -- the source URL
 - `forms` -- list of form type codes (one per `<form>` in the HTML)
 - `visible_html_fields` -- list of field annotation maps (`field_name -> type_code`)
 
-See `data/config.json` for the full list of form and field type codes.
+**Page annotations** (`data/pages/index.json`): each entry maps an HTML file path to:
+- `url` -- the source URL
+- `page_type` -- page type code (e.g. `lg`, `er`, `s4`)
+
+See `data/forms/config.json` for form/field type codes and `data/pages/config.json` for page type codes.
 
 ## Bug Reports
 
