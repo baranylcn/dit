@@ -52,9 +52,6 @@ fmt.Printf("Page accuracy: %.1f%%\n", result.PageAccuracy*100)
 
 ```bash
 # Classify page type and forms on a URL
-dit run https://github.com/login --page
-
-# Classify forms only
 dit run https://github.com/login
 
 # Classify forms in a local file
