@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/spf13/cobra"
 )
 
@@ -34,6 +35,20 @@ type pageIndexEntry struct {
 var version = "dev"
 
 func main() {
+	rootCmd := &cobra.Command{
+		Use:     "dit-collect",
+		Short:   "Collect HTML pages for page type classifier training",
+		Version: version,
+	}
+
+	rootCmd.AddCommand(collectCmd(), crawlCmd(), genSeedCmd())
+
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func collectCmd() *cobra.Command {
 	var (
 		outputDir  string
 		seedFile   string
@@ -45,18 +60,11 @@ func main() {
 		mangleOnly bool
 	)
 
-	rootCmd := &cobra.Command{
-		Use:     "dit-collect",
-		Short:   "Collect HTML pages for page type classifier training",
-		Version: version,
-	}
-
-	collectCmd := &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "collect",
 		Short: "Fetch pages from seed URLs and save to data/pages/",
 		Example: `  dit-collect collect --seed seeds.jsonl --output data/pages
-  dit-collect collect --seed seeds.jsonl --output data/pages --mangle-only
-  dit-collect collect --seed seeds.jsonl --output data/pages --delay 2000`,
+  dit-collect collect --seed seeds.jsonl --output data/pages --mangle-only`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if verbose {
 				slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -73,21 +81,8 @@ func main() {
 				return fmt.Errorf("load index: %w", err)
 			}
 
-			client := &http.Client{
-				Timeout: time.Duration(timeout) * time.Second,
-				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-				},
-				CheckRedirect: func(req *http.Request, via []*http.Request) error {
-					if len(via) >= 5 {
-						return fmt.Errorf("too many redirects")
-					}
-					return nil
-				},
-			}
-
-			htmlDir := filepath.Join(outputDir, "html")
-			if err := os.MkdirAll(htmlDir, 0755); err != nil {
+			client := newHTTPClient(timeout)
+			if err := os.MkdirAll(filepath.Join(outputDir, "html"), 0755); err != nil {
 				return fmt.Errorf("create html dir: %w", err)
 			}
 
@@ -106,7 +101,6 @@ func main() {
 					}
 				}
 
-				// URL mangling for soft-404/error detection
 				if seed.Mangle {
 					mangledURL := manglePath(seed.URL)
 					if mangledURL != "" {
@@ -120,9 +114,9 @@ func main() {
 							slog.Warn("Failed to fetch mangled", "url", mangledURL, "error", err)
 						} else {
 							collected++
-							pageType := "s4" // soft_404
+							pageType := "s4"
 							if status == 404 {
-								pageType = "er" // error
+								pageType = "er"
 							}
 							slog.Info("Collected mangled", "url", mangledURL, "status", status, "type", pageType, "total", collected)
 						}
@@ -137,23 +131,371 @@ func main() {
 			if err := saveIndex(outputDir, index); err != nil {
 				return fmt.Errorf("save index: %w", err)
 			}
-
 			slog.Info("Collection complete", "total", collected, "index_entries", len(index))
 			return nil
 		},
 	}
 
-	collectCmd.Flags().StringVar(&seedFile, "seed", "", "Path to seed file (JSONL)")
-	collectCmd.Flags().StringVar(&outputDir, "output", "data/pages", "Output directory")
-	collectCmd.Flags().IntVar(&timeout, "timeout", 30, "HTTP timeout in seconds")
-	collectCmd.Flags().IntVar(&delay, "delay", 1000, "Delay between requests in milliseconds")
-	collectCmd.Flags().StringVar(&userAgent, "user-agent", "Mozilla/5.0 (compatible; dit-collect/1.0)", "User-Agent header")
-	collectCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
-	collectCmd.Flags().IntVar(&maxPages, "max", 0, "Maximum pages to collect (0 = unlimited)")
-	collectCmd.Flags().BoolVar(&mangleOnly, "mangle-only", false, "Only collect mangled URLs (soft-404/error)")
-	_ = collectCmd.MarkFlagRequired("seed")
+	cmd.Flags().StringVar(&seedFile, "seed", "", "Path to seed file (JSONL)")
+	cmd.Flags().StringVar(&outputDir, "output", "data/pages", "Output directory")
+	cmd.Flags().IntVar(&timeout, "timeout", 30, "HTTP timeout in seconds")
+	cmd.Flags().IntVar(&delay, "delay", 1000, "Delay between requests in ms")
+	cmd.Flags().StringVar(&userAgent, "user-agent", "Mozilla/5.0 (compatible; dit-collect/1.0)", "User-Agent header")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
+	cmd.Flags().IntVar(&maxPages, "max", 0, "Max pages to collect (0=unlimited)")
+	cmd.Flags().BoolVar(&mangleOnly, "mangle-only", false, "Only collect mangled URLs")
+	_ = cmd.MarkFlagRequired("seed")
+	return cmd
+}
 
-	genSeedCmd := &cobra.Command{
+// crawlCmd crawls real websites following links, like soft-404's spider.
+// For each site: fetch homepage (landing), follow discovered links,
+// auto-label by URL pattern, mangle random links for error/soft_404.
+func crawlCmd() *cobra.Command {
+	var (
+		sitesFile  string
+		outputDir  string
+		timeout    int
+		delay      int
+		userAgent  string
+		verbose    bool
+		maxTotal   int
+		maxPerSite int
+		prob404    float64
+	)
+
+	cmd := &cobra.Command{
+		Use:   "crawl",
+		Short: "Crawl websites, follow links, mangle URLs for error/soft_404",
+		Example: `  dit-collect crawl --sites sites.txt --output data/pages
+  dit-collect crawl --sites sites.txt --output data/pages --max-total 1000 --prob404 0.3`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if verbose {
+				slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			}
+
+			sites, err := loadLines(sitesFile)
+			if err != nil {
+				return fmt.Errorf("load sites: %w", err)
+			}
+			slog.Info("Loaded sites", "count", len(sites))
+
+			index, err := loadIndex(outputDir)
+			if err != nil {
+				return fmt.Errorf("load index: %w", err)
+			}
+
+			client := newHTTPClient(timeout)
+			if err := os.MkdirAll(filepath.Join(outputDir, "html"), 0755); err != nil {
+				return fmt.Errorf("create html dir: %w", err)
+			}
+
+			totalCollected := 0
+
+			for _, site := range sites {
+				if maxTotal > 0 && totalCollected >= maxTotal {
+					break
+				}
+
+				site = strings.TrimSpace(site)
+				if site == "" {
+					continue
+				}
+				if !strings.HasPrefix(site, "http") {
+					site = "https://" + site
+				}
+
+				n, err := crawlSite(client, site, userAgent, outputDir, index, crawlOpts{
+					maxPerSite: maxPerSite,
+					maxTotal:   maxTotal,
+					total:      &totalCollected,
+					prob404:    prob404,
+					delay:      time.Duration(delay) * time.Millisecond,
+				})
+				if err != nil {
+					slog.Warn("Failed to crawl site", "site", site, "error", err)
+					continue
+				}
+
+				slog.Info("Finished site", "site", site, "collected", n, "total", totalCollected)
+
+				// Save index periodically
+				if totalCollected%50 == 0 {
+					if err := saveIndex(outputDir, index); err != nil {
+						slog.Warn("Failed to save index", "error", err)
+					}
+				}
+			}
+
+			if err := saveIndex(outputDir, index); err != nil {
+				return fmt.Errorf("save index: %w", err)
+			}
+			slog.Info("Crawl complete", "total", totalCollected, "index_entries", len(index))
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&sitesFile, "sites", "", "File with domain list (one per line)")
+	cmd.Flags().StringVar(&outputDir, "output", "data/pages", "Output directory")
+	cmd.Flags().IntVar(&timeout, "timeout", 30, "HTTP timeout in seconds")
+	cmd.Flags().IntVar(&delay, "delay", 800, "Delay between requests in ms")
+	cmd.Flags().StringVar(&userAgent, "user-agent", "Mozilla/5.0 (compatible; dit-collect/1.0)", "User-Agent header")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
+	cmd.Flags().IntVar(&maxTotal, "max-total", 0, "Max total pages (0=unlimited)")
+	cmd.Flags().IntVar(&maxPerSite, "max-per-site", 20, "Max pages per site")
+	cmd.Flags().Float64Var(&prob404, "prob404", 0.3, "Probability of mangling a discovered link")
+	_ = cmd.MarkFlagRequired("sites")
+	return cmd
+}
+
+type crawlOpts struct {
+	maxPerSite int
+	maxTotal   int
+	total      *int
+	prob404    float64
+	delay      time.Duration
+}
+
+func crawlSite(client *http.Client, siteURL, userAgent, outputDir string, index map[string]pageIndexEntry, opts crawlOpts) (int, error) {
+	siteU, err := url.Parse(siteURL)
+	if err != nil {
+		return 0, err
+	}
+	siteHost := siteU.Hostname()
+
+	// Track visited URLs to avoid duplicates
+	visited := make(map[string]bool)
+	collected := 0
+
+	// 1. Fetch homepage as landing page
+	html, status, err := fetchHTML(client, siteURL, userAgent)
+	if err != nil {
+		return 0, fmt.Errorf("homepage: %w", err)
+	}
+	if status >= 400 || len(html) < 100 {
+		return 0, fmt.Errorf("homepage HTTP %d (%d bytes)", status, len(html))
+	}
+
+	filename := saveHTMLFile(html, siteURL, outputDir)
+	index[filename] = pageIndexEntry{URL: siteURL, PageType: "ln"}
+	visited[siteURL] = true
+	collected++
+	*opts.total++
+	slog.Debug("Collected homepage", "url", siteURL, "type", "ln")
+
+	// 2. Extract links from homepage
+	links := extractLinks(html, siteU)
+
+	// Shuffle links for variety
+	rand.Shuffle(len(links), func(i, j int) { links[i], links[j] = links[j], links[i] })
+
+	// 3. Follow links on same domain
+	for _, link := range links {
+		if collected >= opts.maxPerSite {
+			break
+		}
+		if opts.maxTotal > 0 && *opts.total >= opts.maxTotal {
+			break
+		}
+
+		linkU, err := url.Parse(link)
+		if err != nil {
+			continue
+		}
+
+		// Same host only
+		if linkU.Hostname() != siteHost {
+			continue
+		}
+
+		// Skip already visited
+		normalized := normalizeURL(link)
+		if visited[normalized] {
+			continue
+		}
+		visited[normalized] = true
+
+		// Skip non-page links
+		if skipURL(linkU) {
+			continue
+		}
+
+		time.Sleep(opts.delay)
+
+		// Auto-detect page type from URL
+		pageType := detectPageType(linkU)
+
+		// Fetch the page
+		linkHTML, linkStatus, err := fetchHTML(client, link, userAgent)
+		if err != nil {
+			slog.Debug("Failed to fetch link", "url", link, "error", err)
+			continue
+		}
+
+		if linkStatus == 200 && len(linkHTML) >= 100 && pageType != "" {
+			fn := saveHTMLFile(linkHTML, link, outputDir)
+			index[fn] = pageIndexEntry{URL: link, PageType: pageType}
+			collected++
+			*opts.total++
+			slog.Debug("Collected link", "url", link, "type", pageType)
+
+			// Also extract links from this page for deeper crawling
+			subLinks := extractLinks(linkHTML, siteU)
+			links = append(links, subLinks...)
+		}
+
+		// Mangle with probability prob404 (only for links with path > 1 char)
+		if rand.Float64() < opts.prob404 && len(linkU.Path) > 1 {
+			if opts.maxTotal > 0 && *opts.total >= opts.maxTotal {
+				break
+			}
+			if collected >= opts.maxPerSite {
+				break
+			}
+
+			time.Sleep(opts.delay)
+			mangledURL := manglePath(link)
+			if mangledURL != "" && !visited[mangledURL] {
+				visited[mangledURL] = true
+				mangledHTML, mangledStatus, err := fetchHTML(client, mangledURL, userAgent)
+				if err != nil {
+					slog.Debug("Failed mangled", "url", mangledURL, "error", err)
+					continue
+				}
+
+				if len(mangledHTML) >= 100 && (mangledStatus == 200 || mangledStatus == 404) {
+					mangledType := "s4"
+					if mangledStatus == 404 {
+						mangledType = "er"
+					}
+					fn := saveHTMLFile(mangledHTML, mangledURL, outputDir)
+					index[fn] = pageIndexEntry{URL: mangledURL, PageType: mangledType}
+					collected++
+					*opts.total++
+					slog.Debug("Collected mangled", "url", mangledURL, "status", mangledStatus, "type", mangledType)
+				}
+			}
+		}
+	}
+
+	return collected, nil
+}
+
+// extractLinks extracts all <a href> links from HTML, resolving relative URLs.
+func extractLinks(htmlStr string, base *url.URL) []string {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlStr))
+	if err != nil {
+		return nil
+	}
+
+	var links []string
+	seen := make(map[string]bool)
+	doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
+		href, exists := s.Attr("href")
+		if !exists || href == "" {
+			return
+		}
+
+		// Skip fragments, javascript, mailto
+		if strings.HasPrefix(href, "#") || strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "mailto:") {
+			return
+		}
+
+		// Resolve relative URLs
+		u, err := url.Parse(href)
+		if err != nil {
+			return
+		}
+		resolved := base.ResolveReference(u).String()
+
+		if !seen[resolved] {
+			seen[resolved] = true
+			links = append(links, resolved)
+		}
+	})
+
+	return links
+}
+
+// detectPageType auto-labels a URL based on path patterns.
+// Returns "" if no pattern matches (page won't be saved).
+func detectPageType(u *url.URL) string {
+	path := strings.ToLower(u.Path)
+	host := strings.ToLower(u.Hostname())
+
+	// Login
+	if matchAny(path, "/login", "/signin", "/sign-in", "/sign_in", "/wp-login", "/sso/start", "/auth/login", "/user/login", "/account/login", "/accounts/login") {
+		return "lg"
+	}
+
+	// Registration
+	if matchAny(path, "/register", "/signup", "/sign-up", "/sign_up", "/join", "/create-account", "/user/register", "/accounts/emailsignup") {
+		return "rg"
+	}
+
+	// Password reset
+	if matchAny(path, "/forgot", "/reset-password", "/password/reset", "/password/new", "/account-recovery", "/account/recover", "/password_reset", "/forgot_password", "/forgot-password") {
+		return "pr"
+	}
+
+	// Contact
+	if matchAny(path, "/contact", "/contact-us", "/contact_us") {
+		return "ct"
+	}
+
+	// Search
+	if matchAny(path, "/search") || u.Query().Get("q") != "" || u.Query().Get("s") != "" || u.Query().Get("query") != "" {
+		return "sr"
+	}
+
+	// Blog
+	if matchAny(path, "/blog", "/post/", "/posts/", "/article/", "/articles/", "/news/") ||
+		strings.HasPrefix(host, "blog.") || strings.HasPrefix(host, "engineering.") {
+		return "bl"
+	}
+
+	// Product
+	if matchAny(path, "/product/", "/products/", "/dp/", "/item/", "/itm/", "/p/", "/listing/") {
+		return "pd"
+	}
+
+	return ""
+}
+
+// matchAny checks if path contains any of the given patterns.
+func matchAny(path string, patterns ...string) bool {
+	for _, p := range patterns {
+		if strings.Contains(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// skipURL filters out non-page URLs (images, scripts, etc.)
+func skipURL(u *url.URL) bool {
+	path := strings.ToLower(u.Path)
+	for _, ext := range []string{".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf", ".zip", ".xml", ".json", ".woff", ".woff2", ".ttf", ".mp4", ".mp3", ".webp", ".avif"} {
+		if strings.HasSuffix(path, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeURL strips fragment and trailing slash for dedup.
+func normalizeURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.Fragment = ""
+	s := u.String()
+	return strings.TrimRight(s, "/")
+}
+
+func genSeedCmd() *cobra.Command {
+	cmd := &cobra.Command{
 		Use:   "gen-seeds",
 		Short: "Generate seed file from common URL patterns",
 		Example: `  dit-collect gen-seeds --domains domains.txt --output seeds.jsonl
@@ -207,7 +549,6 @@ func main() {
 					}
 				}
 
-				// Also add the homepage as landing
 				if containsType(typeList, "landing") {
 					seed := seedEntry{URL: domain, ExpectedType: "landing", Mangle: true}
 					if err := enc.Encode(seed); err != nil {
@@ -221,15 +562,27 @@ func main() {
 			return nil
 		},
 	}
-	genSeedCmd.Flags().String("domains", "", "File with domain list (one per line)")
-	genSeedCmd.Flags().String("output", "seeds.jsonl", "Output seed file")
-	genSeedCmd.Flags().String("types", "login,registration,search,contact,password_reset,error,soft_404,admin,landing", "Page types to generate seeds for")
-	_ = genSeedCmd.MarkFlagRequired("domains")
+	cmd.Flags().String("domains", "", "File with domain list (one per line)")
+	cmd.Flags().String("output", "seeds.jsonl", "Output seed file")
+	cmd.Flags().String("types", "login,registration,search,contact,password_reset,error,soft_404,admin,landing", "Page types to generate seeds for")
+	_ = cmd.MarkFlagRequired("domains")
+	return cmd
+}
 
-	rootCmd.AddCommand(collectCmd, genSeedCmd)
+// --- shared helpers ---
 
-	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
+func newHTTPClient(timeoutSec int) *http.Client {
+	return &http.Client{
+		Timeout: time.Duration(timeoutSec) * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
 	}
 }
 
@@ -315,7 +668,6 @@ func fetchHTML(client *http.Client, rawURL, userAgent string) (string, int, erro
 	}
 	defer resp.Body.Close()
 
-	// Limit body size to 5MB
 	body := make([]byte, 0, 1024*1024)
 	buf := make([]byte, 32*1024)
 	for {
@@ -347,10 +699,7 @@ func fetchAndSave(client *http.Client, rawURL, pageType, userAgent, outputDir st
 	}
 
 	filename := saveHTMLFile(html, rawURL, outputDir)
-	index[filename] = pageIndexEntry{
-		URL:      rawURL,
-		PageType: pageType,
-	}
+	index[filename] = pageIndexEntry{URL: rawURL, PageType: pageType}
 	return nil
 }
 
@@ -363,21 +712,17 @@ func fetchAndSaveMangled(client *http.Client, mangledURL, userAgent, outputDir s
 		return status, fmt.Errorf("response too short (%d bytes)", len(html))
 	}
 
-	// Only save if it's a soft-404 (200) or actual 404
 	if status != 200 && status != 404 {
 		return status, fmt.Errorf("unexpected status %d for mangled URL", status)
 	}
 
-	pageType := "s4" // soft_404
+	pageType := "s4"
 	if status == 404 {
-		pageType = "er" // error
+		pageType = "er"
 	}
 
 	filename := saveHTMLFile(html, mangledURL, outputDir)
-	index[filename] = pageIndexEntry{
-		URL:      mangledURL,
-		PageType: pageType,
-	}
+	index[filename] = pageIndexEntry{URL: mangledURL, PageType: pageType}
 	return status, nil
 }
 
@@ -390,7 +735,6 @@ func saveHTMLFile(html, rawURL, outputDir string) string {
 	return filename
 }
 
-// manglePath inserts a random lowercase letter at a random position in the URL path.
 func manglePath(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -402,7 +746,6 @@ func manglePath(rawURL string) string {
 		path = "/index"
 	}
 
-	// Find the last segment
 	lastSlash := strings.LastIndex(path, "/")
 	if lastSlash < 0 {
 		lastSlash = 0
@@ -415,7 +758,6 @@ func manglePath(rawURL string) string {
 		segment = path[lastSlash+1:]
 	}
 
-	// Insert random char at random position
 	pos := rand.IntN(len(segment) + 1)
 	ch := byte('a' + rand.IntN(26))
 	mangled := segment[:pos] + string(ch) + segment[pos:]
