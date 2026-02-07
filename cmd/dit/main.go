@@ -310,7 +310,7 @@ func initApp() {
 	}
 }
 
-const modelURL = "https://github.com/happyhackingspace/dit/releases/latest/download/model.json"
+const modelURL = "https://github.com/happyhackingspace/dit/raw/main/model.json"
 
 func loadOrDownloadModel(modelPath string) (*dit.Classifier, error) {
 	if modelPath != "" {

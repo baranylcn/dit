@@ -25,9 +25,5 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
-release:
-  extra_files:
-    - glob: model.json
-
 changelog:
   sort: asc
