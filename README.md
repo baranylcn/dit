@@ -60,11 +60,17 @@ dit run login.html
 # With probabilities
 dit run https://github.com/login --proba
 
+# Download training data and model from Hugging Face
+dit data download
+
 # Train a model
 dit train model.json --data-folder data
 
 # Evaluate model accuracy
 dit evaluate --data-folder data
+
+# Upload training data and model to Hugging Face
+dit data upload
 ```
 
 ## Page Types
@@ -122,7 +128,7 @@ dit evaluate --data-folder data
 | **Product** | product quantity, sorting option, style select |
 | **Other** | other number, other read-only, other |
 
-Full list of 79 field type codes in [`data/config.json`](data/config.json).
+Full list of 79 field type codes in `data/config.json` (run `dit data download` to get the data).
 
 ## Accuracy
 

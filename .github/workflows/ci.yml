@@ -34,11 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      - name: Download model
+        run: curl -fsSL -o model.json "https://huggingface.co/datasets/happyhackingspace/dit/resolve/main/model.json"
       - run: go test -race -coverprofile=coverage.out ./...
 
   build:
@@ -74,7 +74,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          lfs: true
           fetch-depth: 0
       - uses: actions/setup-go@v6
         with:

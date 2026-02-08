@@ -14,7 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          lfs: true
           fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
