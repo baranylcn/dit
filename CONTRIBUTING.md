@@ -7,6 +7,10 @@ Thank you for your interest in contributing to dit!
 ```bash
 git clone https://github.com/happyhackingspace/dit.git
 cd dit
+
+# Download training data and model from Hugging Face
+go run ./cmd/dit data download
+
 go build ./...
 go test ./...
 ```
@@ -102,7 +106,7 @@ func Evaluate(dataDir string, config *EvalConfig) (*EvalResult, error)
 
 ## Data Contributions
 
-The training data lives in `data/` and consists of annotated HTML forms and pages from real websites.
+The training data is hosted on [Hugging Face](https://huggingface.co/datasets/happyhackingspace/dit) and consists of annotated HTML forms and pages from real websites. Run `dit data download` (or `go run ./cmd/dit data download`) to get the data locally.
 
 ### Adding Form Annotations
 
@@ -123,6 +127,15 @@ Re-train and verify accuracy doesn't regress:
 go run ./cmd/dit train model.json --data-folder data
 go run ./cmd/dit evaluate --data-folder data
 ```
+
+### Uploading Changes
+
+After updating annotations, upload to Hugging Face:
+```bash
+go run ./cmd/dit data upload
+```
+
+This requires the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli) and being logged in (`hf auth login`).
 
 ### Annotation Formats
 
