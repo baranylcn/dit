@@ -517,7 +517,7 @@ func main() {
 					return err
 				}
 			}
-			slog.Debug("HTML fetched", "bytes", len(htmlContent))
+			slog.Debug("HTML fetched", "target", target, "bytes", len(htmlContent))
 
 			start := time.Now()
 			c, err := loadOrDownloadModel(runModelPath)
