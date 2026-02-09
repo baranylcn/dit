@@ -1,7 +1,12 @@
 package dit
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +19,82 @@ const loginFormHTML = `<html><body>
   <input type="submit" value="Log In"/>
 </form>
 </body></html>`
+
+func buildBinary(t *testing.T) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	binary := filepath.Join(tmpDir, "dit")
+
+	cmd := exec.Command("go", "build", "-o", binary, "./cmd/dit")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to build binary: %v\n%s", err, output)
+	}
+
+	return binary
+}
+
+func TestFunctional_RunStdin(t *testing.T) {
+	binary := buildBinary(t)
+
+	cmd := exec.Command(binary, "run", "-s")
+	cmd.Stdin = strings.NewReader(loginFormHTML)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Functional test failed: %v\nStderr: %s", err, stderr.String())
+	}
+
+	// Output can be either page+forms object or just forms array
+	var pageResult struct {
+		Type  string `json:"type"`
+		Forms []struct {
+			Type   string            `json:"type"`
+			Fields map[string]string `json:"fields"`
+		} `json:"forms"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &pageResult); err != nil {
+		t.Fatalf("Output is not valid JSON: %v\nOutput: %s", err, stdout.String())
+	}
+
+	if len(pageResult.Forms) == 0 {
+		t.Fatal("No forms found in output")
+	}
+}
+
+func TestFunctional_RunStdinURL(t *testing.T) {
+	binary := buildBinary(t)
+
+	// Simulating: echo "https://github.com/login" | dit run
+	cmd := exec.Command(binary, "run", "-s")
+	cmd.Stdin = strings.NewReader("https://github.com/login")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Functional URL test failed: %v\nStderr: %s", err, stderr.String())
+	}
+
+	// Output can be either page+forms object or just forms array
+	var pageResult struct {
+		Type  string `json:"type"`
+		Forms []struct {
+			Type   string            `json:"type"`
+			Fields map[string]string `json:"fields"`
+		} `json:"forms"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &pageResult); err != nil {
+		t.Fatalf("Output is not valid JSON: %v\nOutput: %s", err, stdout.String())
+	}
+
+	if len(pageResult.Forms) == 0 {
+		t.Fatal("No forms found in output from URL pipe")
+	}
+}
 
 func TestExtractForms(t *testing.T) {
 	modelPath := "model.json"
